@@ -1,34 +1,37 @@
 package main
 
 import (
-	"fmt"
+	"bufio"
+	"bytes"
 	"io"
-	// Uncomment this block to pass the first stage
 	"net"
 	"os"
+
+	"github.com/inconshreveable/log15"
 )
 
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here!")
+	logger := log15.New()
+	logger.Info("server started, listening on TCP port 6379")
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		logger.Error("Failed to bind to port 6379")
 		os.Exit(1)
 	}
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection: ", err.Error())
+			logger.Error("accepting connection", "error", err)
 			os.Exit(1)
 		}
 
-		go handleConn(conn)
+		go handleConn(conn, logger)
 	}
 }
 
-func handleConn(conn net.Conn) {
+func handleConn(conn net.Conn, log log15.Logger) {
 	for {
 		buf := make([]byte, 1024)
 		_, err := conn.Read(buf)
@@ -36,27 +39,45 @@ func handleConn(conn net.Conn) {
 			if err == io.EOF {
 				break
 			} else {
-				fmt.Println("reading from conn: ", err.Error())
-				os.Exit(1)
+				log.Error("reading from conn", "error", err)
+				break
 			}
 		}
 
-		fmt.Println("recieved conn")
+		log.Debug("recieving connection", "content", string(buf))
 
-		_, err = conn.Write([]byte("+PONG\r\n"))
-		fmt.Println("wrote PONG to conn")
-
+		payload, err := decodeRESP(bufio.NewReader(bytes.NewReader(buf)))
 		if err != nil {
-			fmt.Println("writing to conn: ", err.Error())
-			os.Exit(1)
+			log.Error("decoding RESP object", "error", err)
+			break
+		}
+
+		log.Debug("decoded RESP object", "object", payload)
+
+		command, args := payload.Children[0], payload.Children[1:]
+		switch string(command.Value) {
+		case "ping":
+			handlePing(conn)
+		case "echo":
+			handleEcho(conn, args[0].Value)
+		default:
+			break
 		}
 	}
 
-	fmt.Println("closing conn")
 	err := conn.Close()
 
 	if err != nil {
-		fmt.Println("closing conn: ", err.Error())
-		os.Exit(1)
+		log.Error("closing connection", "error", err)
 	}
+}
+
+func handlePing(conn net.Conn) error {
+	_, err := conn.Write(encodeSimpleString([]byte("PONG")))
+	return err
+}
+
+func handleEcho(conn net.Conn, arg []byte) error {
+	_, err := conn.Write(encodeBulkString(arg))
+	return err
 }
