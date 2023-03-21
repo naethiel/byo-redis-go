@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -10,28 +11,51 @@ import (
 	"github.com/inconshreveable/log15"
 )
 
-func main() {
-	logger := log15.New()
-	logger.Info("server started, listening on TCP port 6379")
+type Service struct {
+	Store    Store
+	Log      log15.Logger
+	Port     int
+	Protocol string
+}
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+func (s *Service) Configure() error {
+	s.Log = log15.New()
+	s.Port = 6379
+	s.Store = Store{}
+	s.Protocol = "tcp"
+
+	return nil
+}
+
+func main() {
+	var s Service
+	err := s.Configure()
 	if err != nil {
-		logger.Error("Failed to bind to port 6379")
+		fmt.Printf("Failed to configure service: %s", err.Error())
+		os.Exit(1)
+		return
+	}
+
+	s.Log.Info("server started, listening", "protocol", s.Protocol, "port", s.Port)
+
+	l, err := net.Listen(s.Protocol, fmt.Sprintf("0.0.0.0:%d", s.Port))
+	if err != nil {
+		s.Log.Error("Failed to bind to port 6379")
 		os.Exit(1)
 	}
 
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			logger.Error("accepting connection", "error", err)
+			s.Log.Error("accepting connection", "error", err)
 			os.Exit(1)
 		}
 
-		go handleConn(conn, logger)
+		go s.handleConn(conn)
 	}
 }
 
-func handleConn(conn net.Conn, log log15.Logger) {
+func (s Service) handleConn(conn net.Conn) {
 	for {
 		buf := make([]byte, 1024)
 		_, err := conn.Read(buf)
@@ -39,27 +63,55 @@ func handleConn(conn net.Conn, log log15.Logger) {
 			if err == io.EOF {
 				break
 			} else {
-				log.Error("reading from conn", "error", err)
+				s.Log.Error("reading from conn", "error", err)
 				break
 			}
 		}
 
-		log.Debug("recieving connection", "content", string(buf))
+		s.Log.Debug("recieving connection", "content", string(buf))
 
 		payload, err := decodeRESP(bufio.NewReader(bytes.NewReader(buf)))
 		if err != nil {
-			log.Error("decoding RESP object", "error", err)
+			s.Log.Error("decoding RESP object", "error", err)
 			break
 		}
 
-		log.Debug("decoded RESP object", "object", payload)
+		s.Log.Debug("decoded RESP object", "object", payload)
 
-		command, args := payload.Children[0], payload.Children[1:]
+		if len(payload.Children) == 0 {
+			s.Log.Error("no command in decoded RESP object", "resp", payload)
+			break
+		}
+
+		command := payload.Children[0]
+		args := make([]RESP, 0, len(payload.Children))
+		if len(payload.Children) > 1 {
+			args = append(args, payload.Children[1:]...)
+		}
+
+		s.Log.Debug("handling command", "type", string(command.Value))
+
 		switch string(command.Value) {
 		case "ping":
-			handlePing(conn)
+			err := s.handlePing(conn)
+			if err != nil {
+				s.Log.Error("handling ping request", "error", err)
+			}
 		case "echo":
-			handleEcho(conn, args[0].Value)
+			err := s.handleEcho(conn, args)
+			if err != nil {
+				s.Log.Error("handling echo request", "error", err)
+			}
+		case "set":
+			err := s.handleSet(conn, args)
+			if err != nil {
+				s.Log.Error("handling set request", "error", err)
+			}
+		case "get":
+			err := s.handleGet(conn, args)
+			if err != nil {
+				s.Log.Error("handling get request", "error", err)
+			}
 		default:
 			break
 		}
@@ -68,16 +120,47 @@ func handleConn(conn net.Conn, log log15.Logger) {
 	err := conn.Close()
 
 	if err != nil {
-		log.Error("closing connection", "error", err)
+		s.Log.Error("closing connection", "error", err)
 	}
 }
 
-func handlePing(conn net.Conn) error {
+func (s Service) handleGet(conn net.Conn, args []RESP) error {
+	if len(args) == 0 {
+		return fmt.Errorf("not enough args provided to GET handler")
+	}
+
+	val, exists := s.Store.Get(args[0].Value)
+
+	if !exists {
+		s.Log.Debug("value not found in store", "key", string(args[0].Value))
+	}
+
+	_, err := conn.Write(encodeBulkString(val))
+	return err
+}
+
+func (s Service) handleSet(conn net.Conn, args []RESP) error {
+	if len(args) < 2 {
+		return fmt.Errorf("not enough arguments provided to SET handler")
+	}
+
+	s.Store.Set(args[0].Value, args[1].Value)
+
+	_, err := conn.Write(encodeSimpleString([]byte("OK")))
+	return err
+}
+
+func (s *Service) handlePing(conn net.Conn) error {
 	_, err := conn.Write(encodeSimpleString([]byte("PONG")))
 	return err
 }
 
-func handleEcho(conn net.Conn, arg []byte) error {
+func (s *Service) handleEcho(conn net.Conn, args []RESP) error {
+	var arg []byte
+	if len(args) > 0 {
+		arg = args[0].Value
+	}
+
 	_, err := conn.Write(encodeBulkString(arg))
 	return err
 }
